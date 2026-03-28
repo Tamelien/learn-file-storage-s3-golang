@@ -4,10 +4,10 @@ import (
 	"bytes"
 	"fmt"
 	"io"
+	"mime"
 	"net/http"
 	"os"
 	"path/filepath"
-	"strings"
 
 	"github.com/bootdotdev/learn-file-storage-s3-golang-starter/internal/auth"
 	"github.com/google/uuid"
@@ -62,11 +62,28 @@ func (cfg *apiConfig) handlerUploadThumbnail(w http.ResponseWriter, r *http.Requ
 		return
 	}
 
-	mediaType := header.Header.Get("Content-Type")
-	fileExtension := strings.Split(mediaType, "/")[1]
+	contentType := header.Header.Get("Content-Type")
+	mediaType, _, err := mime.ParseMediaType(contentType)
+	if err != nil {
+		respondWithError(w, http.StatusBadRequest, "Invalid Content-Type", err)
+		return
+	}
+
+	if mediaType != "image/jpeg" && mediaType != "image/png" {
+		respondWithError(w, http.StatusBadRequest, "Unsupported media type", nil)
+		return
+	}
+
+	exts, err := mime.ExtensionsByType(mediaType)
+	if err != nil || len(exts) == 0 {
+		respondWithError(w, http.StatusInternalServerError, "Could not determine file extension", err)
+		return
+	}
+
+	extension := exts[0]
 
 	dataPath := filepath.Join(cfg.assetsRoot,
-		fmt.Sprintf("%s.%s", videoID, fileExtension))
+		fmt.Sprintf("%s.%s", videoID, extension))
 
 	dst, err := os.Create(dataPath)
 	if err != nil {
@@ -80,7 +97,7 @@ func (cfg *apiConfig) handlerUploadThumbnail(w http.ResponseWriter, r *http.Requ
 	}
 
 	dataURL := fmt.Sprintf("http://localhost:%s/assets/%s.%s",
-		cfg.port, videoID, fileExtension)
+		cfg.port, videoID, extension)
 	video.ThumbnailURL = &dataURL
 
 	err = cfg.db.UpdateVideo(video)
