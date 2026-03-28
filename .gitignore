@@ -3,3 +3,4 @@ out
 .env
 assets/
 samples/
+learn-file-storage-s3-golang-starter
