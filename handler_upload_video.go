@@ -4,11 +4,14 @@ import (
 	"context"
 	"crypto/rand"
 	"encoding/hex"
+	"encoding/json"
 	"fmt"
 	"io"
+	"math"
 	"mime"
 	"net/http"
 	"os"
+	"os/exec"
 
 	"github.com/aws/aws-sdk-go-v2/aws"
 	"github.com/aws/aws-sdk-go-v2/service/s3"
@@ -111,8 +114,26 @@ func (cfg *apiConfig) handlerUploadVideo(w http.ResponseWriter, r *http.Request)
 		respondWithError(w, http.StatusInternalServerError, "Couldn't generate random key", err)
 		return
 	}
+
+	aspectRatio, err := getVideoAspectRatio(videoTempData.Name())
+	if err != nil {
+		respondWithError(w, http.StatusInternalServerError, "Couldn't get aspect ratio", err)
+		return
+	}
+
+	var prefix string
+
+	switch aspectRatio {
+	case "16:9":
+		prefix = "landscape"
+	case "9:16":
+		prefix = "portrait"
+	default:
+		prefix = "other"
+	}
+
 	randomName := hex.EncodeToString(key)
-	fileName := fmt.Sprintf("%s.%s", randomName, extension)
+	fileName := fmt.Sprintf("%s/%s.%s", prefix, randomName, extension)
 	// Upload video to S3
 	_, err = cfg.s3Client.PutObject(context.Background(), &s3.PutObjectInput{
 		Bucket:      aws.String(cfg.s3Bucket),
@@ -140,4 +161,47 @@ func (cfg *apiConfig) handlerUploadVideo(w http.ResponseWriter, r *http.Request)
 
 	respondWithJSON(w, http.StatusOK, video)
 
+}
+
+func getVideoAspectRatio(filePath string) (string, error) {
+
+	info, err := os.Stat(filePath)
+	if err != nil {
+		return "", err
+	}
+	isFile := info.Mode().IsRegular()
+	if !isFile {
+		return "", fmt.Errorf("%s is not a File", filePath)
+	}
+
+	cmd := exec.Command("ffprobe", "-v", "error", "-print_format", "json", "-show_streams", filePath)
+	output, err := cmd.Output()
+	if err != nil {
+		return "", err
+	}
+
+	type Video struct {
+		Streams []struct {
+			Width  int `json:"width"`
+			Height int `json:"height"`
+		} `json:"streams"`
+	}
+
+	var result Video
+	if err = json.Unmarshal(output, &result); err != nil {
+		return "", err
+	}
+	width := result.Streams[0].Width
+	height := result.Streams[0].Height
+
+	ratio := float64(width) / float64(height)
+
+	switch {
+	case math.Abs(ratio-16.0/9.0) < 0.01:
+		return "16:9", nil
+	case math.Abs(ratio-9.0/16.0) < 0.01:
+		return "9:16", nil
+	default:
+		return "other", nil
+	}
 }
