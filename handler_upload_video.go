@@ -22,7 +22,7 @@ import (
 func (cfg *apiConfig) handlerUploadVideo(w http.ResponseWriter, r *http.Request) {
 	// Limit request body to 1GB
 	const maxMemory = 1 << 30
-	http.MaxBytesReader(w, r.Body, maxMemory)
+	r.Body = http.MaxBytesReader(w, r.Body, maxMemory)
 
 	// Parse and validate video ID from URL path
 	videoIDString := r.PathValue("videoID")
@@ -54,9 +54,10 @@ func (cfg *apiConfig) handlerUploadVideo(w http.ResponseWriter, r *http.Request)
 
 	if video.UserID != userID {
 		respondWithError(w, http.StatusUnauthorized, "Unauthorized", fmt.Errorf("Unauthorized"))
+		return
 	}
 
-	fmt.Println("uploading thumbnail for video", videoID, "by user", userID)
+	fmt.Println("uploading video: ", videoID, "by user: ", userID)
 	// Parse multipart form and extract video file
 	file, header, err := r.FormFile("video")
 	if err != nil {
@@ -107,6 +108,22 @@ func (cfg *apiConfig) handlerUploadVideo(w http.ResponseWriter, r *http.Request)
 		return
 	}
 
+	// Re-encode video with faststart flag so playback can begin before full download
+	fastStartVideoPath, err := processVideoForFastStart(videoTempData.Name())
+	if err != nil {
+		respondWithError(w, http.StatusInternalServerError, "Couldn't create fast start video", err)
+		return
+	}
+	defer os.Remove(fastStartVideoPath)
+
+	// Open the processed file for S3 upload
+	fastStartFile, err := os.Open(fastStartVideoPath)
+	if err != nil {
+		respondWithError(w, http.StatusInternalServerError, "Couldn't open processed video", err)
+		return
+	}
+	defer fastStartFile.Close()
+
 	// Generate a random filename for the S3 object
 	key := make([]byte, 32)
 	_, err = rand.Read(key)
@@ -115,14 +132,15 @@ func (cfg *apiConfig) handlerUploadVideo(w http.ResponseWriter, r *http.Request)
 		return
 	}
 
-	aspectRatio, err := getVideoAspectRatio(videoTempData.Name())
+	// Detect aspect ratio to determine S3 folder prefix
+	aspectRatio, err := getVideoAspectRatio(fastStartFile.Name())
 	if err != nil {
 		respondWithError(w, http.StatusInternalServerError, "Couldn't get aspect ratio", err)
 		return
 	}
 
+	// Map aspect ratio to orientation prefix for S3 key
 	var prefix string
-
 	switch aspectRatio {
 	case "16:9":
 		prefix = "landscape"
@@ -134,11 +152,12 @@ func (cfg *apiConfig) handlerUploadVideo(w http.ResponseWriter, r *http.Request)
 
 	randomName := hex.EncodeToString(key)
 	fileName := fmt.Sprintf("%s/%s.%s", prefix, randomName, extension)
-	// Upload video to S3
+
+	// Upload processed video to S3
 	_, err = cfg.s3Client.PutObject(context.Background(), &s3.PutObjectInput{
 		Bucket:      aws.String(cfg.s3Bucket),
 		Key:         aws.String(fileName),
-		Body:        videoTempData,
+		Body:        fastStartFile,
 		ContentType: aws.String(mediaType),
 	})
 
@@ -163,6 +182,35 @@ func (cfg *apiConfig) handlerUploadVideo(w http.ResponseWriter, r *http.Request)
 
 }
 
+// processVideoForFastStart re-encodes the video with the moov atom moved to the front,
+// allowing streaming playback to start before the full file is downloaded.
+// Returns the path to the processed output file.
+func processVideoForFastStart(filePath string) (string, error) {
+
+	info, err := os.Stat(filePath)
+	if err != nil {
+		return "", err
+	}
+	isFile := info.Mode().IsRegular()
+	if !isFile {
+		return "", fmt.Errorf("%s is not a File", filePath)
+	}
+
+	outputFilePath := fmt.Sprintf("%s.processing", filePath)
+
+	// Run ffmpeg to copy streams and apply faststart flag
+	cmd := exec.Command("ffmpeg", "-i", filePath, "-c", "copy", "-movflags", "faststart",
+		"-f", "mp4", outputFilePath)
+	err = cmd.Run()
+	if err != nil {
+		return "", err
+	}
+
+	return outputFilePath, nil
+}
+
+// getVideoAspectRatio uses ffprobe to read the video stream dimensions
+// and returns the orientation as "16:9", "9:16", or "other".
 func getVideoAspectRatio(filePath string) (string, error) {
 
 	info, err := os.Stat(filePath)
@@ -174,6 +222,7 @@ func getVideoAspectRatio(filePath string) (string, error) {
 		return "", fmt.Errorf("%s is not a File", filePath)
 	}
 
+	// Use ffprobe to extract stream metadata as JSON
 	cmd := exec.Command("ffprobe", "-v", "error", "-print_format", "json", "-show_streams", filePath)
 	output, err := cmd.Output()
 	if err != nil {
@@ -194,6 +243,7 @@ func getVideoAspectRatio(filePath string) (string, error) {
 	width := result.Streams[0].Width
 	height := result.Streams[0].Height
 
+	// Compare ratio with tolerance to handle minor encoding differences
 	ratio := float64(width) / float64(height)
 
 	switch {
